@@ -1,0 +1,24 @@
+# 待检测域名及其预期的 llc（可多个，支持前缀匹配）
+domains:
+  - name: www.facebook.com
+    expected_llcs: ["FACEBOOK"]
+  - name: www.google.com
+    expected_llcs: ["GOOGLE"]
+  - name: www.gmail.com
+    expected_llcs: ["GOOGLE"]
+  - name: amazon.co.jp
+    expected_llcs: ["AMAZON"]
+  - name: www.apkmirror.com
+    expected_llcs: ["CLOUDFLARE"]
+  - name: archiveofourown.org
+    expected_llcs: ["CLOUDFLARE"]
+  - name: audiomack.com
+    expected_llcs: ["AMAZON"]
+  - name: bbc.com
+    expected_llcs: ["FASTLY"]
+  - name: www.dailymotion.com
+    expected_llcs: ["GOOGLE", "AMAZON"]  # 支持多个
+  - name: discord.com
+    expected_llcs: ["CLOUDFLARE"]
+  - name: www.dlsite.com
+    expected_llcs: ["CLOUDFLARE"]
