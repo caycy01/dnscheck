@@ -17,8 +17,18 @@ domains:
   - name: bbc.com
     expected_llcs: ["FASTLY"]
   - name: www.dailymotion.com
-    expected_llcs: ["GOOGLE", "AMAZON"]  # 支持多个
+    expected_llcs: ["GOOGLE", "AMAZON"]
   - name: discord.com
     expected_llcs: ["CLOUDFLARE"]
   - name: www.dlsite.com
     expected_llcs: ["CLOUDFLARE"]
+  - name: v2ex.com
+    expected_llcs: ["CLOUDFLARE"]
+  - name: example.vercel.app
+    expected_llcs: ["VERCEL", "AMAZON"]
+  - name: whatsapp.com
+    expected_llcs: ["FACEBOOK"]
+  - name: www.youtube.com
+    expected_llcs: ["GOOGLE"]
+  - name: www.twitch.tv
+    expected_llcs: ["FASTLY"]   
