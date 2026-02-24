@@ -55,7 +55,7 @@ var (
 	configFile  = flag.String("f", "sites.yaml", "配置文件路径")
 	timeout     = flag.Duration("timeout", 10*time.Second, "HTTP 请求超时")
 	outputFile  = flag.String("output", "", "输出报告文件路径（默认自动生成带时间戳的文件）")
-	rps         = flag.Float64("rps", 0, "每秒请求数限制 (0 表示不限速)") // 新增速率限制参数
+	rps         = flag.Float64("rps", 2, "每秒请求数限制 (0 表示不限速)") // 新增速率限制参数
 )
 
 func main() {
