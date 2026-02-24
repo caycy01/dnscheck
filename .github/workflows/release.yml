@@ -21,7 +21,9 @@ jobs:
           check-latest: true
 
       - name: Download dependencies
-        run: go mod download
+        run: |
+          go mod init dnscheck
+          go mod download
 
       - name: Build binaries
         run: |
