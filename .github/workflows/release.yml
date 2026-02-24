@@ -30,15 +30,15 @@ jobs:
         run: |
           mkdir -p dist
           # Linux amd64
-          GOOS=linux GOARCH=amd64 go build -o dist/dnscheck-linux-amd64
+          GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -trimpath -o dist/dnscheck-linux-amd64
           # Linux arm64
-          GOOS=linux GOARCH=arm64 go build -o dist/dnscheck-linux-arm64
+          GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -trimpath -o dist/dnscheck-linux-arm64
           # Windows amd64
-          GOOS=windows GOARCH=amd64 go build -o dist/dnscheck-windows-amd64.exe
+          GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -trimpath -o dist/dnscheck-windows-amd64.exe
           # macOS amd64
-          GOOS=darwin GOARCH=amd64 go build -o dist/dnscheck-darwin-amd64
+          GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -trimpath -o dist/dnscheck-darwin-amd64
           # macOS arm64 (Apple Silicon)
-          GOOS=darwin GOARCH=arm64 go build -o dist/dnscheck-darwin-arm64
+          GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -trimpath -o dist/dnscheck-darwin-arm64
 
       - name: Copy config file
         run: cp sites.yaml dist/
