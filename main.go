@@ -17,45 +17,45 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Config 结构体，对应 YAML 文件
+// ---------- 配置结构 ----------
 type Config struct {
 	Domains []DomainConfig `yaml:"domains"`
 }
 
 type DomainConfig struct {
 	Name         string   `yaml:"name"`
-	ExpectedLlcs []string `yaml:"expected_llcs"`
+	ExpectedLlcs []string `yaml:"expected_llcs"` // 支持前缀匹配
 }
 
-// IPInfo API 返回的数据结构
-type IPInfo struct {
-	IP      string `json:"ip"`
-	BeginIP string `json:"beginip"`
-	EndIP   string `json:"endip"`
-	Region  string `json:"region"`
-	ISP     string `json:"isp"`
-	ASN     string `json:"asn"`
-	LLC     string `json:"llc"`
+// ---------- API 响应 ----------
+// IPInfoRaw 使用 map 灵活解析，避免字段变更导致崩溃
+type IPInfoRaw map[string]interface{}
+
+// ---------- 检测结果 ----------
+type IPCheckResult struct {
+	IP        string
+	ActualLLC string
+	Error     error // 若为 nil 表示查询成功
 }
 
-// 检测结果
-type CheckResult struct {
-	Domain     string
-	IP         string
-	ActualLLC  string
-	Expected   []string
-	IsPolluted bool  // true 表示该 IP 对应的 llc 不在预期内（或汇总后域名被污染）
-	Error      error // DNS 或 API 错误
+type DomainResult struct {
+	Domain      string
+	Expected    []string
+	IPResults   []IPCheckResult
+	IsPolluted  bool // 汇总后的污染结论
+	Summary     string
 }
 
+// ---------- 命令行参数 ----------
 var (
-	apiURL      = flag.String("api", "https://uapis.cn/api/v1/network/ipinfo?ip=", "IP 信息查询 API 地址")
+	apiURL      = flag.String("api", "https://uapis.cn/api/v1/network/ipinfo?ip=", "IP 信息查询 API 地址（支持多个，用逗号分隔，将依次尝试）")
 	concurrency = flag.Int("c", 2, "并发查询数")
 	strict      = flag.Bool("strict", false, "严格模式：所有解析 IP 的 llc 都必须在预期内才算正常")
 	configFile  = flag.String("f", "sites.yaml", "配置文件路径")
 	timeout     = flag.Duration("timeout", 10*time.Second, "HTTP 请求超时")
 	outputFile  = flag.String("output", "", "输出报告文件路径（默认自动生成带时间戳的文件）")
-	rps         = flag.Float64("rps", 2, "每秒请求数限制 (0 表示不限速)") // 新增速率限制参数
+	rps         = flag.Float64("rps", 2, "每秒请求数限制 (0 表示不限速)")
+	maxRetries  = flag.Int("retry", 2, "API 请求失败时的最大重试次数")
 )
 
 func main() {
@@ -68,18 +68,24 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 2. 创建速率限制器（如果设置了 rps > 0）
+	// 2. 创建速率限制器
 	var limiter *rate.Limiter
 	if *rps > 0 {
-		limiter = rate.NewLimiter(rate.Limit(*rps), 1) // burst 设为 1，可根据需要调整
+		limiter = rate.NewLimiter(rate.Limit(*rps), 1)
 	}
 
-	// 3. 创建带并发限制的工作池
+	// 3. 解析 API 列表（支持多个备用）
+	apiList := strings.Split(*apiURL, ",")
+	for i := range apiList {
+		apiList[i] = strings.TrimSpace(apiList[i])
+	}
+
+	// 4. 带并发限制的工作池
 	sem := make(chan struct{}, *concurrency)
 	var wg sync.WaitGroup
-	results := make(chan CheckResult, len(config.Domains)*2) // 缓冲避免阻塞
+	results := make(chan DomainResult, len(config.Domains))
 
-	// 4. 对每个域名启动 goroutine 进行检测
+	// 5. 处理每个域名
 	for _, dc := range config.Domains {
 		wg.Add(1)
 		go func(dc DomainConfig) {
@@ -87,159 +93,69 @@ func main() {
 			sem <- struct{}{}        // 获取令牌
 			defer func() { <-sem }() // 释放令牌
 
-			// DNS 解析
-			ips, err := net.LookupIP(dc.Name)
+			// DNS 解析（带超时）
+			ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+			defer cancel()
+			var r net.Resolver
+			ips, err := r.LookupIP(ctx, "ip4", dc.Name) // 直接获取 IPv4
 			if err != nil {
-				results <- CheckResult{
+				results <- DomainResult{
 					Domain:     dc.Name,
-					Error:      fmt.Errorf("DNS 解析失败: %v", err),
+					Expected:   dc.ExpectedLlcs,
+					Summary:    fmt.Sprintf("DNS 解析失败: %v", err),
 					IsPolluted: true, // 解析失败视为可疑
 				}
 				return
 			}
-
-			// 过滤出 IPv4 地址（可选，也可保留 IPv6）
-			var ipv4s []net.IP
-			for _, ip := range ips {
-				if ip.To4() != nil {
-					ipv4s = append(ipv4s, ip)
-				}
-			}
-			if len(ipv4s) == 0 {
-				results <- CheckResult{
+			if len(ips) == 0 {
+				results <- DomainResult{
 					Domain:     dc.Name,
-					Error:      fmt.Errorf("没有找到 IPv4 地址"),
+					Expected:   dc.ExpectedLlcs,
+					Summary:    "没有找到 IPv4 地址",
 					IsPolluted: true,
 				}
 				return
 			}
 
 			// 对每个 IP 查询 LLC
-			domainResults := make([]CheckResult, 0, len(ipv4s))
-			for _, ip := range ipv4s {
+			ipResults := make([]IPCheckResult, 0, len(ips))
+			for _, ip := range ips {
 				// 速率限制等待
 				if limiter != nil {
-					// 使用 context.Background()，因为这里的等待不应该被取消
-					if err := limiter.Wait(context.Background()); err != nil {
-						// 理论上不会出错，但若出错则记录并跳过该 IP
-						domainResults = append(domainResults, CheckResult{
-							Domain:     dc.Name,
-							IP:         ip.String(),
-							Error:      fmt.Errorf("速率限制等待失败: %v", err),
-							IsPolluted: true,
-						})
-						continue
-					}
+					_ = limiter.Wait(context.Background()) // 忽略错误，因为不会发生
 				}
 
-				llc, err := queryLLC(ip.String(), *apiURL, *timeout)
-				if err != nil {
-					domainResults = append(domainResults, CheckResult{
-						Domain:     dc.Name,
-						IP:         ip.String(),
-						Error:      err,
-						IsPolluted: true,
-					})
-					continue
-				}
-
-				// 检查 llc 是否在预期列表中（支持前缀匹配）
-				matched := false
-				for _, exp := range dc.ExpectedLlcs {
-					if strings.HasPrefix(llc, exp) {
-						matched = true
-						break
-					}
-				}
-				domainResults = append(domainResults, CheckResult{
-					Domain:     dc.Name,
-					IP:         ip.String(),
-					ActualLLC:  llc,
-					Expected:   dc.ExpectedLlcs,
-					IsPolluted: !matched,
+				llc, err := fetchLLCWithRetry(ip.String(), apiList, *timeout, *maxRetries)
+				ipResults = append(ipResults, IPCheckResult{
+					IP:        ip.String(),
+					ActualLLC: llc,
+					Error:     err,
 				})
 			}
 
-			// 根据 strict 模式汇总该域名的最终结论
-			// 如果 strict 为 false，只要有一个 IP 正常就算正常；否则所有 IP 必须正常
-			finalPolluted := true
-			if !*strict {
-				// 宽松模式：至少有一个 IP 正常
-				for _, r := range domainResults {
-					if !r.IsPolluted && r.Error == nil {
-						finalPolluted = false
-						break
-					}
-				}
-			} else {
-				// 严格模式：所有 IP 都正常才算正常
-				finalPolluted = false
-				for _, r := range domainResults {
-					if r.IsPolluted || r.Error != nil {
-						finalPolluted = true
-						break
-					}
-				}
-			}
-
-			// 将所有结果发送到通道，并附加 finalPolluted 信息
-			for _, r := range domainResults {
-				r.IsPolluted = finalPolluted // 将汇总结论赋值给每个子结果
-				results <- r
-			}
+			// 汇总该域名的结论
+			domainRes := aggregateDomainResult(dc.Name, dc.ExpectedLlcs, ipResults, *strict)
+			results <- domainRes
 		}(dc)
 	}
 
-	// 5. 等待所有检测完成，关闭结果通道
+	// 6. 等待所有任务完成，关闭结果通道
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
-	// 6. 收集结果并统计
-	domainMap := make(map[string][]CheckResult)
+	// 7. 收集结果并生成报告
+	var domainResults []DomainResult
 	for res := range results {
-		domainMap[res.Domain] = append(domainMap[res.Domain], res)
+		domainResults = append(domainResults, res)
 	}
 
-	// 统计污染域名数量
-	totalDomains := len(domainMap)
-	pollutedCount := 0
-	for _, resList := range domainMap {
-		// 取第一个结果的 IsPolluted 作为该域名的最终状态（因为所有结果该值相同）
-		if len(resList) > 0 && resList[0].IsPolluted {
-			pollutedCount++
-		}
-	}
-
-	// 计算污染率
-	pollutionRate := 0.0
-	if totalDomains > 0 {
-		pollutionRate = float64(pollutedCount) / float64(totalDomains) * 100
-	}
-
-	// 确定污染等级
-	var level string
-	switch {
-	case pollutionRate < 20:
-		level = "正常"
-	case pollutionRate < 40:
-		level = "轻度污染"
-	case pollutionRate < 60:
-		level = "中度污染"
-	default:
-		level = "重度污染"
-	}
-
-	// 生成报告内容
-	report := buildReport(domainMap, totalDomains, pollutedCount, pollutionRate, level)
-
-	// 输出到终端
+	// 8. 统计与报告
+	report := buildReport(domainResults)
 	fmt.Print(report)
 
-	// 输出到文件
 	if *outputFile == "" {
-		// 自动生成文件名
 		*outputFile = fmt.Sprintf("dnscheck_report_%s.txt", time.Now().Format("20060102_150405"))
 	}
 	if err := writeReportToFile(report, *outputFile); err != nil {
@@ -249,7 +165,7 @@ func main() {
 	fmt.Printf("\n报告已保存至: %s\n", *outputFile)
 }
 
-// 加载 YAML 配置文件
+// ---------- 加载配置 ----------
 func loadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -263,41 +179,177 @@ func loadConfig(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-// 调用 IP 信息 API 获取 LLC
-func queryLLC(ip, baseURL string, timeout time.Duration) (string, error) {
+// ---------- 带重试的 LLC 查询 ----------
+func fetchLLCWithRetry(ip string, apiList []string, timeout time.Duration, maxRetries int) (string, error) {
+	var lastErr error
+	// 对每个 API 端点依次尝试
+	for _, baseURL := range apiList {
+		for attempt := 0; attempt <= maxRetries; attempt++ {
+			llc, err := queryLLCFromAPI(ip, baseURL, timeout)
+			if err == nil {
+				return llc, nil
+			}
+			lastErr = err
+			// 如果是可重试的错误（如网络超时、5xx），则等待后重试
+			if isRetryable(err) && attempt < maxRetries {
+				time.Sleep(backoffDuration(attempt))
+				continue
+			}
+			// 否则跳出当前 API 的重试循环，尝试下一个 API
+			break
+		}
+	}
+	return "", fmt.Errorf("所有 API 尝试均失败: %w", lastErr)
+}
+
+// 判断错误是否可重试（可根据需要扩展）
+func isRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	// 简单示例：网络超时、临时性错误可重试
+	if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "EOF") {
+		return true
+	}
+	// 可增加对具体 HTTP 状态码的判断（由上层传入）
+	return false
+}
+
+// 退避时间：指数退避
+func backoffDuration(attempt int) time.Duration {
+	return time.Duration(1<<uint(attempt)) * time.Second
+}
+
+// ---------- 调用单个 API 获取 LLC ----------
+func queryLLCFromAPI(ip, baseURL string, timeout time.Duration) (string, error) {
 	url := baseURL + ip
 	client := http.Client{Timeout: timeout}
 	resp, err := client.Get(url)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("HTTP 请求失败: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		// 将 4xx 视为不可重试，5xx 视为可重试（由上层决定）
 		return "", fmt.Errorf("API 返回非 200 状态码: %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("读取响应体失败: %w", err)
 	}
 
-	var info IPInfo
-	err = json.Unmarshal(body, &info)
+	// 使用 map 解析，避免字段变更导致崩溃
+	var raw IPInfoRaw
+	err = json.Unmarshal(body, &raw)
+	if err != nil {
+		return "", fmt.Errorf("JSON 解析失败: %w", err)
+	}
+
+	// 提取 llc 字段，支持多种可能的键名（可配置）
+	llc, err := extractLLC(raw)
 	if err != nil {
 		return "", err
 	}
-	if info.LLC == "" {
-		return "", fmt.Errorf("API 返回的 LLC 为空")
-	}
-	return info.LLC, nil
+	return llc, nil
 }
 
-// 构建报告字符串
-func buildReport(domainMap map[string][]CheckResult, total, polluted int, rate float64, level string) string {
+// 从解析后的 map 中提取 LLC 字段（容错处理）
+func extractLLC(data map[string]interface{}) (string, error) {
+	// 尝试常见的字段名
+	possibleKeys := []string{"llc", "isp", "carrier", "org", "asn_description"}
+	for _, key := range possibleKeys {
+		if val, ok := data[key]; ok {
+			if str, ok := val.(string); ok && str != "" {
+				return str, nil
+			}
+		}
+	}
+	// 如果都没有，返回错误，但附带部分数据供调试
+	return "", fmt.Errorf("无法从响应中提取 LLC 字段，响应内容: %v", data)
+}
+
+// ---------- 汇总域名结果 ----------
+func aggregateDomainResult(domain string, expected []string, ipResults []IPCheckResult, strict bool) DomainResult {
+	// 先统计每个 IP 是否匹配预期
+	ipMatches := make([]bool, len(ipResults))
+	anySuccess := false
+	allMatch := true
+
+	for i, res := range ipResults {
+		if res.Error != nil {
+			// 查询失败的 IP 视为不匹配
+			ipMatches[i] = false
+			allMatch = false
+			continue
+		}
+		// 检查 LLC 是否匹配预期（前缀匹配）
+		matched := false
+		for _, exp := range expected {
+			if strings.HasPrefix(res.ActualLLC, exp) {
+				matched = true
+				break
+			}
+		}
+		ipMatches[i] = matched
+		if matched {
+			anySuccess = true
+		} else {
+			allMatch = false
+		}
+	}
+
+	// 根据模式确定最终污染结论
+	var polluted bool
+	var summary string
+	if strict {
+		polluted = !allMatch // 严格模式：必须全部匹配才算正常
+		if polluted {
+			summary = "严格模式：部分 IP 不符合预期"
+		} else {
+			summary = "所有 IP 均符合预期"
+		}
+	} else {
+		polluted = !anySuccess // 宽松模式：至少有一个匹配才算正常
+		if polluted {
+			summary = "宽松模式：无任何 IP 符合预期"
+		} else {
+			summary = "至少有一个 IP 符合预期"
+		}
+	}
+
+	// 构建详细 IP 结果列表（保持原样）
+	detailed := make([]IPCheckResult, len(ipResults))
+	copy(detailed, ipResults)
+
+	return DomainResult{
+		Domain:     domain,
+		Expected:   expected,
+		IPResults:  detailed,
+		IsPolluted: polluted,
+		Summary:    summary,
+	}
+}
+
+// ---------- 构建报告 ----------
+func buildReport(results []DomainResult) string {
 	var b strings.Builder
 
-	// 标题和时间
+	// 统计
+	total := len(results)
+	polluted := 0
+	for _, r := range results {
+		if r.IsPolluted {
+			polluted++
+		}
+	}
+	rate := 0.0
+	if total > 0 {
+		rate = float64(polluted) / float64(total) * 100
+	}
+	level := pollutionLevel(rate)
+
 	b.WriteString("DNS 污染检测报告\n")
 	b.WriteString(fmt.Sprintf("生成时间: %s\n", time.Now().Format("2006-01-02 15:04:05")))
 	b.WriteString("=================\n")
@@ -308,26 +360,47 @@ func buildReport(domainMap map[string][]CheckResult, total, polluted int, rate f
 	b.WriteString("=================\n\n")
 	b.WriteString("详细结果:\n")
 
-	for domain, resList := range domainMap {
-		b.WriteString(fmt.Sprintf("域名: %s\n", domain))
-		for _, r := range resList {
-			if r.Error != nil {
-				b.WriteString(fmt.Sprintf("  IP %s: 错误 - %v\n", r.IP, r.Error))
+	for _, res := range results {
+		b.WriteString(fmt.Sprintf("域名: %s\n", res.Domain))
+		b.WriteString(fmt.Sprintf("  汇总: %s (污染: %v)\n", res.Summary, res.IsPolluted))
+		for _, ipRes := range res.IPResults {
+			if ipRes.Error != nil {
+				b.WriteString(fmt.Sprintf("  IP %s: 错误 - %v\n", ipRes.IP, ipRes.Error))
 			} else {
+				// 检查是否匹配预期（用于报告显示）
+				matched := false
+				for _, exp := range res.Expected {
+					if strings.HasPrefix(ipRes.ActualLLC, exp) {
+						matched = true
+						break
+					}
+				}
 				status := "正常"
-				if r.IsPolluted {
+				if !matched {
 					status = "可能被污染"
 				}
-				b.WriteString(fmt.Sprintf("  IP %s: LLC=%s (期望: %v) - %s\n", r.IP, r.ActualLLC, r.Expected, status))
+				b.WriteString(fmt.Sprintf("  IP %s: LLC=%s (期望: %v) - %s\n", ipRes.IP, ipRes.ActualLLC, res.Expected, status))
 			}
 		}
 		b.WriteString("\n")
 	}
-
 	return b.String()
 }
 
-// 将报告写入文件
+func pollutionLevel(rate float64) string {
+	switch {
+	case rate < 20:
+		return "正常"
+	case rate < 40:
+		return "轻度污染"
+	case rate < 60:
+		return "中度污染"
+	default:
+		return "重度污染"
+	}
+}
+
+// ---------- 写入文件 ----------
 func writeReportToFile(report, filename string) error {
 	return os.WriteFile(filename, []byte(report), 0644)
 }
