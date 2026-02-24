@@ -17,7 +17,7 @@ domains:
   - name: bbc.com
     expected_llcs: ["FASTLY"]
   - name: www.dailymotion.com
-    expected_llcs: ["GOOGLE", "AMAZON"]
+    expected_llcs: ["GOOGLE", "AMAZON","Dailymotion"]
   - name: discord.com
     expected_llcs: ["CLOUDFLARE"]
   - name: www.dlsite.com
