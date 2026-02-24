@@ -23,6 +23,7 @@ jobs:
       - name: Download dependencies
         run: |
           go mod init dnscheck
+          go mod tidy
           go mod download
 
       - name: Build binaries
