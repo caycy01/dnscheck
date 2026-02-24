@@ -1,0 +1,59 @@
+name: Release
+
+于:
+  push:
+    tags:
+      - 'v*'  # 当推送以 v 开头的标签时触发，例如 v1.0.0
+
+jobs:
+  build:
+    name: Build and Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'  # 可根据需要调整 Go 版本
+          check-latest: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Build binaries
+        run: |
+          mkdir -p dist
+          # Linux amd64
+          GOOS=linux GOARCH=amd64 go build -o dist/dnscheck-linux-amd64
+          # Linux arm64
+          GOOS=linux GOARCH=arm64 go build -o dist/dnscheck-linux-arm64
+          # Windows amd64
+          GOOS=windows GOARCH=amd64 go build -o dist/dnscheck-windows-amd64.exe
+          # macOS amd64
+          GOOS=darwin GOARCH=amd64 go build -o dist/dnscheck-darwin-amd64
+          # macOS arm64 (Apple Silicon)
+          GOOS=darwin GOARCH=arm64 go build -o dist/dnscheck-darwin-arm64
+
+      - name: Create archives
+        run: |
+          cd dist
+          # Linux
+          tar czf dnscheck-linux-amd64.tar.gz dnscheck-linux-amd64
+          tar czf dnscheck-linux-arm64.tar.gz dnscheck-linux-arm64
+          # Windows
+          zip dnscheck-windows-amd64.zip dnscheck-windows-amd64.exe
+          # macOS
+          tar czf dnscheck-darwin-amd64.tar.gz dnscheck-darwin-amd64
+          tar czf dnscheck-darwin-arm64.tar.gz dnscheck-darwin-arm64
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
