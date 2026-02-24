@@ -1,10 +1,9 @@
 name: Release
 
-于:
+on:
   push:
     tags:
-      - 'v*'  # 当推送以 v 开头的标签时触发，例如 v1.0.0
-
+      - 'v*'
 jobs:
   build:
     name: Build and Release
