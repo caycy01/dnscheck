@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/time/rate"
 	"gopkg.in/yaml.v3"
 )
 
@@ -48,11 +50,12 @@ type CheckResult struct {
 
 var (
 	apiURL      = flag.String("api", "https://uapis.cn/api/v1/network/ipinfo?ip=", "IP 信息查询 API 地址")
-	concurrency = flag.Int("c", 5, "并发查询数")
+	concurrency = flag.Int("c", 2, "并发查询数")
 	strict      = flag.Bool("strict", false, "严格模式：所有解析 IP 的 llc 都必须在预期内才算正常")
 	configFile  = flag.String("f", "sites.yaml", "配置文件路径")
 	timeout     = flag.Duration("timeout", 10*time.Second, "HTTP 请求超时")
 	outputFile  = flag.String("output", "", "输出报告文件路径（默认自动生成带时间戳的文件）")
+	rps         = flag.Float64("rps", 0, "每秒请求数限制 (0 表示不限速)") // 新增速率限制参数
 )
 
 func main() {
@@ -65,12 +68,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 2. 创建带并发限制的工作池
+	// 2. 创建速率限制器（如果设置了 rps > 0）
+	var limiter *rate.Limiter
+	if *rps > 0 {
+		limiter = rate.NewLimiter(rate.Limit(*rps), 1) // burst 设为 1，可根据需要调整
+	}
+
+	// 3. 创建带并发限制的工作池
 	sem := make(chan struct{}, *concurrency)
 	var wg sync.WaitGroup
 	results := make(chan CheckResult, len(config.Domains)*2) // 缓冲避免阻塞
 
-	// 3. 对每个域名启动 goroutine 进行检测
+	// 4. 对每个域名启动 goroutine 进行检测
 	for _, dc := range config.Domains {
 		wg.Add(1)
 		go func(dc DomainConfig) {
@@ -108,6 +117,21 @@ func main() {
 			// 对每个 IP 查询 LLC
 			domainResults := make([]CheckResult, 0, len(ipv4s))
 			for _, ip := range ipv4s {
+				// 速率限制等待
+				if limiter != nil {
+					// 使用 context.Background()，因为这里的等待不应该被取消
+					if err := limiter.Wait(context.Background()); err != nil {
+						// 理论上不会出错，但若出错则记录并跳过该 IP
+						domainResults = append(domainResults, CheckResult{
+							Domain:     dc.Name,
+							IP:         ip.String(),
+							Error:      fmt.Errorf("速率限制等待失败: %v", err),
+							IsPolluted: true,
+						})
+						continue
+					}
+				}
+
 				llc, err := queryLLC(ip.String(), *apiURL, *timeout)
 				if err != nil {
 					domainResults = append(domainResults, CheckResult{
@@ -166,13 +190,13 @@ func main() {
 		}(dc)
 	}
 
-	// 4. 等待所有检测完成，关闭结果通道
+	// 5. 等待所有检测完成，关闭结果通道
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
-	// 5. 收集结果并统计
+	// 6. 收集结果并统计
 	domainMap := make(map[string][]CheckResult)
 	for res := range results {
 		domainMap[res.Domain] = append(domainMap[res.Domain], res)
