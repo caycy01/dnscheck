@@ -24,7 +24,7 @@
 
 ### 获取代码
 ```bash
-git clone https://github.com/yourusername/dnscheck.git
+git clone https://github.com/caycy01/dnscheck.git
 cd dnscheck
 ```
 
