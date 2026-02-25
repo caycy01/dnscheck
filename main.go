@@ -1,8 +1,8 @@
 package main
 
 import (
+	_ "embed" // 用于嵌入配置文件，使用匿名导入避免 "imported and not used" 错误
 	"context"
-	"embed"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -20,6 +20,7 @@ import (
 
 //go:embed sites.yaml
 var defaultConfigYAML []byte // 嵌入默认配置文件
+
 
 // ---------- 配置结构 ----------
 type Config struct {
