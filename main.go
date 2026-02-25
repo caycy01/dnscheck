@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"embed"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -17,6 +18,9 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+//go:embed sites.yaml
+var defaultConfigYAML []byte // 嵌入默认配置文件
+
 // ---------- 配置结构 ----------
 type Config struct {
 	Domains []DomainConfig `yaml:"domains"`
@@ -24,34 +28,33 @@ type Config struct {
 
 type DomainConfig struct {
 	Name         string   `yaml:"name"`
-	ExpectedLlcs []string `yaml:"expected_llcs"` // 支持前缀匹配
+	ExpectedLlcs []string `yaml:"expected_llcs"`
 }
 
 // ---------- API 响应 ----------
-// IPInfoRaw 使用 map 灵活解析，避免字段变更导致崩溃
 type IPInfoRaw map[string]interface{}
 
 // ---------- 检测结果 ----------
 type IPCheckResult struct {
 	IP        string
 	ActualLLC string
-	Error     error // 若为 nil 表示查询成功
+	Error     error
 }
 
 type DomainResult struct {
-	Domain      string
-	Expected    []string
-	IPResults   []IPCheckResult
-	IsPolluted  bool // 汇总后的污染结论
-	Summary     string
+	Domain     string
+	Expected   []string
+	IPResults  []IPCheckResult
+	IsPolluted bool
+	Summary    string
 }
 
 // ---------- 命令行参数 ----------
 var (
-	apiURL      = flag.String("api", "https://uapis.cn/api/v1/network/ipinfo?ip=", "IP 信息查询 API 地址（支持多个，用逗号分隔，将依次尝试）")
+	apiURL      = flag.String("api", "https://uapis.cn/api/v1/network/ipinfo?ip=", "IP 信息查询 API 地址（支持多个，用逗号分隔）")
 	concurrency = flag.Int("c", 2, "并发查询数")
 	strict      = flag.Bool("strict", false, "严格模式：所有解析 IP 的 llc 都必须在预期内才算正常")
-	configFile  = flag.String("f", "sites.yaml", "配置文件路径")
+	configFile  = flag.String("f", "sites.yaml", "配置文件路径（默认使用内嵌配置）")
 	timeout     = flag.Duration("timeout", 10*time.Second, "HTTP 请求超时")
 	outputFile  = flag.String("output", "", "输出报告文件路径（默认自动生成带时间戳的文件）")
 	rps         = flag.Float64("rps", 2, "每秒请求数限制 (0 表示不限速)")
@@ -61,8 +64,8 @@ var (
 func main() {
 	flag.Parse()
 
-	// 1. 加载配置
-	config, err := loadConfig(*configFile)
+	// 1. 加载配置（优先外部，否则使用内嵌）
+	config, err := loadConfigWithFallback(*configFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "加载配置文件失败: %v\n", err)
 		os.Exit(1)
@@ -74,13 +77,13 @@ func main() {
 		limiter = rate.NewLimiter(rate.Limit(*rps), 1)
 	}
 
-	// 3. 解析 API 列表（支持多个备用）
+	// 3. 解析 API 列表
 	apiList := strings.Split(*apiURL, ",")
 	for i := range apiList {
 		apiList[i] = strings.TrimSpace(apiList[i])
 	}
 
-	// 4. 带并发限制的工作池
+	// 4. 并发工作池
 	sem := make(chan struct{}, *concurrency)
 	var wg sync.WaitGroup
 	results := make(chan DomainResult, len(config.Domains))
@@ -90,20 +93,20 @@ func main() {
 		wg.Add(1)
 		go func(dc DomainConfig) {
 			defer wg.Done()
-			sem <- struct{}{}        // 获取令牌
-			defer func() { <-sem }() // 释放令牌
+			sem <- struct{}{}
+			defer func() { <-sem }()
 
-			// DNS 解析（带超时）
+			// DNS 解析
 			ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 			defer cancel()
 			var r net.Resolver
-			ips, err := r.LookupIP(ctx, "ip4", dc.Name) // 直接获取 IPv4
+			ips, err := r.LookupIP(ctx, "ip4", dc.Name)
 			if err != nil {
 				results <- DomainResult{
 					Domain:     dc.Name,
 					Expected:   dc.ExpectedLlcs,
 					Summary:    fmt.Sprintf("DNS 解析失败: %v", err),
-					IsPolluted: true, // 解析失败视为可疑
+					IsPolluted: true,
 				}
 				return
 			}
@@ -117,14 +120,12 @@ func main() {
 				return
 			}
 
-			// 对每个 IP 查询 LLC
+			// 查询每个 IP 的 LLC
 			ipResults := make([]IPCheckResult, 0, len(ips))
 			for _, ip := range ips {
-				// 速率限制等待
 				if limiter != nil {
-					_ = limiter.Wait(context.Background()) // 忽略错误，因为不会发生
+					_ = limiter.Wait(context.Background())
 				}
-
 				llc, err := fetchLLCWithRetry(ip.String(), apiList, *timeout, *maxRetries)
 				ipResults = append(ipResults, IPCheckResult{
 					IP:        ip.String(),
@@ -133,25 +134,25 @@ func main() {
 				})
 			}
 
-			// 汇总该域名的结论
+			// 汇总域名结果
 			domainRes := aggregateDomainResult(dc.Name, dc.ExpectedLlcs, ipResults, *strict)
 			results <- domainRes
 		}(dc)
 	}
 
-	// 6. 等待所有任务完成，关闭结果通道
+	// 6. 等待所有任务完成
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
-	// 7. 收集结果并生成报告
+	// 7. 收集结果
 	var domainResults []DomainResult
 	for res := range results {
 		domainResults = append(domainResults, res)
 	}
 
-	// 8. 统计与报告
+	// 8. 生成报告
 	report := buildReport(domainResults)
 	fmt.Print(report)
 
@@ -165,19 +166,33 @@ func main() {
 	fmt.Printf("\n报告已保存至: %s\n", *outputFile)
 }
 
-// ---------- 加载配置 ----------
-func loadConfig(path string) (*Config, error) {
+// loadConfigWithFallback 尝试读取外部配置文件，失败时回退到内嵌配置
+func loadConfigWithFallback(path string) (*Config, error) {
+	// 先尝试读取外部文件
 	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
+	if err == nil {
+		// 成功读取外部文件，解析
+		var cfg Config
+		if err := yaml.Unmarshal(data, &cfg); err != nil {
+			return nil, fmt.Errorf("解析外部配置文件 %s 失败: %w", path, err)
+		}
+		return &cfg, nil
 	}
-	var cfg Config
-	err = yaml.Unmarshal(data, &cfg)
-	if err != nil {
-		return nil, err
+
+	// 读取失败，判断是否为文件不存在且路径为默认值
+	if os.IsNotExist(err) && path == "sites.yaml" {
+		// 使用内嵌的默认配置
+		var cfg Config
+		if err := yaml.Unmarshal(defaultConfigYAML, &cfg); err != nil {
+			return nil, fmt.Errorf("解析内嵌默认配置失败: %w", err)
+		}
+		return &cfg, nil
 	}
-	return &cfg, nil
+
+	// 其他错误（权限错误）或用户指定了不存在的文件，直接报错
+	return nil, fmt.Errorf("读取配置文件 %s 失败: %w", path, err)
 }
+
 
 // ---------- 带重试的 LLC 查询 ----------
 func fetchLLCWithRetry(ip string, apiList []string, timeout time.Duration, maxRetries int) (string, error) {
