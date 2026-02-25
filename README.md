@@ -28,22 +28,19 @@ git clone https://github.com/yourusername/dnscheck.git
 cd dnscheck
 ```
 
-### 安装依赖
+### 编译命令
 ```bash
-go mod init dnscheck
-go get gopkg.in/yaml.v3
+go mod init dnscheck  # 如果未初始化模块
+go get golang.org/x/time/rate gopkg.in/yaml.v3
+go build -ldflags="-s -w" -trimpath -o dnscheck
 ```
 
-### 编译
-**Linux / macOS:**
-```bash
-go build -o dnscheck main.go
-```
+编译后得到单文件 `dnscheck`，可直接运行。
 
-**Windows:**
-```bash
-go build -o dnscheck.exe main.go
-```
+> 若要进一步压缩体积，可使用 UPX：`upx --best dnscheck`
+
+---
+
 
 ## 配置文件
 
@@ -85,22 +82,39 @@ domains:
 ```bash
 ./dnscheck
 ```
+## 命令行参数
 
-### 命令行参数
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `-f` | `sites.yaml` | 配置文件路径 |
-| `-api` | `https://uapis.cn/api/v1/network/ipinfo?ip=` | IP 归属查询 API 地址 |
-| `-c` | `5` | 并发查询数 |
-| `-strict` | `false` | 严格模式（true：所有解析 IP 的 LLC 均需符合预期才算正常） |
-| `-timeout` | `10s` | HTTP 请求超时时间 |
-| `-output` | 自动生成 | 报告输出文件路径，如 `-output report.txt` |
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `-api` | string | `https://uapis.cn/api/v1/network/ipinfo?ip=` | IP 信息查询 API 地址（支持多个，用逗号分隔） |
+| `-c` | int | `2` | 并发查询的域名数 |
+| `-strict` | bool | `false` | 严格模式（所有 IP 必须匹配） |
+| `-f` | string | `sites.yaml` | 配置文件路径（默认使用内嵌配置） |
+| `-timeout` | duration | `10s` | HTTP 请求超时时间 |
+| `-output` | string | 自动生成 | 输出报告文件路径，若不指定则自动生成带时间戳的文件 |
+| `-rps` | float | `2` | 每秒 API 请求数限制（0 表示不限速） |
+| `-retry` | int | `2` | API 请求失败时的最大重试次数 |
 
-### 示例
+---
+
+## 使用示例
+
+### 基本使用
 ```bash
-# 使用自定义配置文件，严格模式，并发 10
-./dnscheck -f my_sites.yaml -strict -c 10 -output my_report.txt
+./dnscheck
 ```
+使用默认配置文件 `sites.yaml`（若无则使用内嵌默认），并发 2，API 请求限速 2 rps。
+
+### 指定配置文件
+```bash
+./dnscheck -f my_sites.yaml
+```
+
+### 使用多个备用 API
+```bash
+./dnscheck -api="https://api1.example.com/ip?ip=,https://api2.example.com/ip?ip="
+```
+
 
 ## 输出说明
 
@@ -136,7 +150,8 @@ DNS 污染检测报告
 
 ## 注意事项
 
-1. **API 依赖**：程序需要调用外部 IP 归属 API，请确保网络可达且 API 未限流。如 API 不可用，可替换为其他提供类似 JSON 格式的 API。
-2. **DNS 解析**：使用系统默认 DNS，若系统本身已配置被污染的 DNS，则解析结果可能异常，但本程序正是通过对比来发现这种异常。
-4. **IPv6 支持**：程序默认只检查 IPv4 地址，如需 IPv6 可修改代码中的过滤逻辑。
+1. **API 兼容性**：默认 API 返回的 JSON 中应包含 `llc` 字段。若字段名不同，可修改 `extractLLC` 函数中的 `possibleKeys` 列表。
+2. **配置文件嵌入**：使用 `//go:embed` 嵌入的默认配置文件必须与 `main.go` 位于同一目录，且文件名为 `sites.yaml`。
+3. **并发与速率限制**：`-c` 控制域名级并发，`-rps` 控制全局 API 请求速率。建议根据 API 限制合理调整。
 
+---
